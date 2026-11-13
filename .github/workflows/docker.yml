@@ -1,0 +1,176 @@
+# Build the private source here and publish a multi-arch image to GHCR.
+#
+# THIS REPOSITORY IS PUBLIC AND THE SOURCE IS NOT. Its logs are readable by
+# anyone, so:
+#
+#   - only a person with write access can start this (workflow_dispatch);
+#   - SOURCE_TOKEN is a read-only fine-grained PAT for nguyenthdat/ida-pro,
+#     kept in the environment `release`, which only main may use;
+#   - the Docker build log goes to a file, because a plain build log repeats the
+#     private Dockerfile and its RUN commands. On failure only error lines are
+#     shown; for the rest, run ./build.sh locally;
+#   - no build cache and no artifacts of the source. Each arch pushes
+#     <tag>-linux-<arch> and <tag>-gui-linux-<arch>; the merge job joins
+#     them into multi-arch manifests on the registry. The GUI tag comes from
+#     the Dockerfile `squash` stage, so it is one layer.
+#
+# The runners are native (ubuntu-24.04 / ubuntu-24.04-arm), so the ~550 MB
+# installer never runs under emulation.
+
+name: Docker
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag, like 9.4
+        required: true
+        type: string
+        default: "9.4"
+      source_ref:
+        description: Branch, tag, or commit in nguyenthdat/ida-pro
+        required: true
+        type: string
+        default: main
+      push_latest:
+        description: Also tag the manifest as `latest`
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: nguyenthdat/ida-pro
+  IMAGE: ghcr.io/theunknownzoo/ida-pro
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.inputs.outputs.tag }}
+    steps:
+      - name: Check the inputs
+        id: inputs
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$TAG" =~ ^[0-9]+(\.[0-9]+)*$ ]] || { echo "::error::$TAG is not like 9.4"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    environment: release
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+          path: source
+
+      - name: Installers
+        working-directory: source
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: python3 download_installer.py --linux --arch "$ARCH"
+
+      - name: Sign in to GHCR
+        env:
+          TOKEN: ${{ github.token }}
+        run: printf %s "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and push
+        working-directory: source
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          docker buildx create --driver docker-container --name ci >/dev/null 2>&1 || true
+          docker buildx use ci
+          log="$RUNNER_TEMP/build.log"
+
+          build_variant() {
+            local with_gui="$1"
+            local image_tag="$2"
+            local label="$3"
+            local target="$4"
+            echo "==> Building $label ($image_tag)..."
+            if ! docker buildx build \
+                  --platform "$PLATFORM" \
+                  --target "$target" \
+                  --build-arg WITH_GUI="$with_gui" \
+                  --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+                  --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+                  --label "org.opencontainers.image.version=$TAG" \
+                  -t "$image_tag" \
+                  --push \
+                  . > "$log" 2>&1; then
+              grep -E '(^|\s)(ERROR|error:|failed|Error response)' "$log" | tail -40 || true
+              echo "::error::$label build failed. The full log stays private; run ./build.sh locally."
+              exit 1
+            fi
+            echo "pushed $image_tag"
+          }
+
+          # 1. Headless (standard)
+          build_variant 0 "$IMAGE:$TAG-linux-$ARCH" "Headless" runtime
+
+          # 2. GUI (reuses the install stage cached from headless). Built from
+          #    the squash stage: one layer for the whole rootfs, so the tag
+          #    does not expose the build steps or the /opt/ida copy, and the
+          #    chown layer no longer stores IDA a second time.
+          build_variant 1 "$IMAGE:$TAG-gui-linux-$ARCH" "GUI" squash
+
+  merge:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Sign in to GHCR
+        env:
+          TOKEN: ${{ github.token }}
+        run: printf %s "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Join the architectures
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          LATEST: ${{ inputs.push_latest }}
+        run: |
+          # 1. Headless manifest
+          tags=(--tag "$IMAGE:$TAG")
+          [ "$LATEST" = true ] && tags+=(--tag "$IMAGE:latest")
+          docker buildx imagetools create "${tags[@]}" \
+            "$IMAGE:$TAG-linux-amd64" "$IMAGE:$TAG-linux-arm64"
+          docker buildx imagetools inspect "$IMAGE:$TAG"
+
+          # 2. GUI manifest
+          tags_gui=(--tag "$IMAGE:$TAG-gui")
+          [ "$LATEST" = true ] && tags_gui+=(--tag "$IMAGE:latest-gui" --tag "$IMAGE:gui")
+          docker buildx imagetools create "${tags_gui[@]}" \
+            "$IMAGE:$TAG-gui-linux-amd64" "$IMAGE:$TAG-gui-linux-arm64"
+          docker buildx imagetools inspect "$IMAGE:$TAG-gui"
